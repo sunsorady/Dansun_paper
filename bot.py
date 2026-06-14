@@ -9,8 +9,7 @@ How to run:
   2. pip install scihub           # Sci-Hub (optional)
   3. pip install libgen-api       # Library Genesis (optional)
   4. pip install zlibrary-sync    # Z-Library (optional)
-  5. pip install annas-py         # Anna's Archive (optional)
-  6. set TELEGRAM_BOT_TOKEN=your_token_here
+  5. set TELEGRAM_BOT_TOKEN=your_token_here
      set UNPAYWALL_EMAIL=your@email.com
   7. python bot.py
 
