@@ -268,6 +268,10 @@ def _check_size_before_download(url: str) -> Optional[int]:
     return None
 
 
+# Module-level download progress callback (set by handle_doi for Telegram progress updates)
+_download_progress_cb = None
+
+
 def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResult:
     """Download PDF with redirect detection, HTML check, base64 fallback, and one retry.
 
@@ -325,7 +329,24 @@ def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResul
                         continue
                     return SourceResult()
 
-                body_bytes = b"".join(r.iter_content(chunk_size=8192))
+                total_size = content_length or int(r.headers.get("Content-Length", 0)) or None
+                downloaded = 0
+                chunks = []
+                last_pct = -1
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        chunks.append(chunk)
+                        downloaded += len(chunk)
+                        cb = _download_progress_cb
+                        if cb:
+                            if total_size:
+                                pct = min(downloaded * 100 // total_size, 100)
+                                if pct != last_pct:
+                                    last_pct = pct
+                                    cb(downloaded, total_size)
+                            else:
+                                cb(downloaded, None)
+                body_bytes = b"".join(chunks)
 
                 ct = r.headers.get("Content-Type", "").lower()
                 if "text/html" in ct:
@@ -1233,8 +1254,7 @@ async def get_pdf_from_researchgate_async(doi: str) -> SourceResult:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📄 *Open Access PDF Bot*\n\n"
-        "Send me a DOI (e.g. `10.1038/nature12373`) or paste a link.\n"
-        "I'll search legal OA sources first, then shadow libraries.\n\n"
+        "Send me a DOI (e.g. `10.1038/nature12373`) or paste a link.\n\n"
         "Commands:\n"
         "`/doi <DOI>` — fetch a paper by DOI\n"
         "`/help` — show this help\n"
@@ -1248,26 +1268,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "Send any message containing a DOI like `10.1038/nature12373`\n"
         "or use `/doi 10.1038/nature12373`\n\n"
-        "Fallback chain:\n"
-        "1️⃣ Unpaywall (legal)\n"
-        "2️⃣ OpenAlex (legal)\n"
-        "3️⃣ CORE (legal)\n"
-        "4️⃣ Semantic Scholar (legal)\n"
-        "5️⃣ Open Access Button\n"
-        "6️⃣ Zenodo\n"
-        "7️⃣ Internet Archive Scholar\n"
-        "8️⃣ BASE (legal)\n"
-        "9️⃣ PubMed Central\n"
-        "🔟 Sci‑Hub\n"
-        "1️⃣1️⃣ Library Genesis\n"
-        "1️⃣2️⃣ Z‑Library\n"
-        "1️⃣3️⃣ Europe PMC\n"
-        "1️⃣4️⃣ bioRxiv\n"
-        "1️⃣5️⃣ medRxiv\n"
-        "1️⃣6️⃣ arXiv\n"
-        "1️⃣7️⃣ ResearchGate\n"
-        "1️⃣8️⃣ STC / Nexus\n"
-        "1️⃣9️⃣ Crossref (metadata only)\n\n"
         "Max file size: 50 MB. Larger files returned as links.",
         parse_mode="Markdown",
         reply_markup=BASIC_KEYBOARD,
@@ -1280,11 +1280,7 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📌 *Version:* 2.0\n"
         "👤 *Developer:* DanSun-2026\n"
         "✉️ *Telegram:* @TheGodVann\n\n"
-        "🔍 Fetches open-access PDFs via:\n"
-        "Unpaywall → OpenAlex → CORE → Semantic Scholar → OA Button →\n"
-        "Zenodo → IA Scholar → BASE → PubMed Central → Sci‑Hub →\n"
-        "LibGen → Z‑Library → Europe PMC → bioRxiv → medRxiv → arXiv →\n"
-        "ResearchGate → STC\n\n"
+
         "Built with Python · python-telegram-bot · Requests\n"
         "NIH PoW auto-solver included.",
         parse_mode="Markdown",
@@ -1385,6 +1381,18 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
     result: SourceResult = SourceResult()
     total = len(sources)
 
+    loop = asyncio.get_event_loop()
+
+    def _progress(done: int, total_size: Optional[int]) -> None:
+        if total_size:
+            pct = min(done * 100 // total_size, 100)
+            text = f"📥 Downloading ... {pct}% ({done / 1024 / 1024:.1f}MB / {total_size / 1024 / 1024:.1f}MB)"
+        else:
+            text = f"📥 Downloading ... {done / 1024 / 1024:.1f}MB so far"
+        asyncio.run_coroutine_threadsafe(msg.edit_text(text), loop)
+
+    _download_progress_cb = _progress
+
     for i, (name, func) in enumerate(sources, 1):
         pct = i * 100 // total
         filled = "▓" * i
@@ -1406,6 +1414,8 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
                     f"📄 Paper found via {name} but exceeds 50 MB limit."
                 )
             break
+
+    _download_progress_cb = None
 
     # --- METADATA FALLBACK (if no PDF) ---
     if not result:
