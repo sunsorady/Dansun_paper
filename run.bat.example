@@ -1,0 +1,5 @@
+@echo off
+set TELEGRAM_BOT_TOKEN=your_token_here
+set UNPAYWALL_EMAIL=your@email.com
+python bot.py
+pause
