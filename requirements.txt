@@ -3,4 +3,4 @@ requests>=2.31.0
 scihub>=0.0.1
 libgen-api>=1.0.1
 zlibrary-sync>=1.5.0
-geck-stc>=0.1.0
+libstc-geck>=2.0.0
