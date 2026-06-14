@@ -1383,9 +1383,16 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
     ]
 
     result: SourceResult = SourceResult()
+    total = len(sources)
 
-    for name, func in sources:
-        await msg.edit_text(f"🔍 Trying {name} ...")
+    for i, (name, func) in enumerate(sources, 1):
+        pct = i * 100 // total
+        filled = "▓" * i
+        empty = "░" * (total - i)
+        await msg.edit_text(
+            f"🔍 [{filled}{empty}] {i}/{total} ({pct}%)\n"
+            f"Trying {name} ..."
+        )
         try:
             result = await func(doi)
         except Exception as e:
