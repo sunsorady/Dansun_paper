@@ -513,9 +513,6 @@ def get_pdf_from_semantic_scholar(doi: str) -> SourceResult:
 
 def _get_pdf_from_scihub_sync(doi: str) -> SourceResult:
     """Synchronous helper – called via ``asyncio.to_thread``."""
-    if not _HAS_SCIHUB:
-        logger.warning("Sci-Hub: package 'scihub' not installed, skipping")
-        return SourceResult()
     SCIHUB_DOMAINS = [
         "https://sci-hub.ru",
         "https://sci-hub.mksa.top",
@@ -553,22 +550,25 @@ def _get_pdf_from_scihub_sync(doi: str) -> SourceResult:
                     return result
         except Exception:
             continue
-    sh = SciHub()
-    try:
-        result = sh.fetch(doi)
-        if isinstance(result, dict):
-            pdf_bytes = result.get("pdf")
-            if pdf_bytes and pdf_bytes.startswith(b"%PDF"):
-                if len(pdf_bytes) > MAX_FILE_SIZE:
-                    logger.info(
-                        f"Sci-Hub: PDF exceeds 50 MB "
-                        f"({len(pdf_bytes) / 1024 / 1024:.1f} MB)"
-                    )
-                    return SourceResult()
-                logger.info("Sci-Hub: PDF downloaded successfully")
-                return SourceResult(pdf_bytes=pdf_bytes)
-    except Exception as e:
-        logger.warning(f"Sci-Hub package failed for {doi}: {e}")
+    if _HAS_SCIHUB:
+        sh = SciHub()
+        try:
+            result = sh.fetch(doi)
+            if isinstance(result, dict):
+                pdf_bytes = result.get("pdf")
+                if pdf_bytes and pdf_bytes.startswith(b"%PDF"):
+                    if len(pdf_bytes) > MAX_FILE_SIZE:
+                        logger.info(
+                            f"Sci-Hub: PDF exceeds 50 MB "
+                            f"({len(pdf_bytes) / 1024 / 1024:.1f} MB)"
+                        )
+                        return SourceResult()
+                    logger.info("Sci-Hub: PDF downloaded successfully")
+                    return SourceResult(pdf_bytes=pdf_bytes)
+        except Exception as e:
+            logger.warning(f"Sci-Hub package failed for {doi}: {e}")
+    else:
+        logger.info("Sci-Hub: package 'scihub' not installed, direct scraping only")
     return SourceResult()
 
 
@@ -582,23 +582,84 @@ async def get_pdf_from_scihub(doi: str) -> SourceResult:
 
 def _get_pdf_from_libgen_sync(doi: str) -> SourceResult:
     """Synchronous helper – called via ``asyncio.to_thread``."""
-    if not _HAS_LIBGEN:
-        logger.warning("LibGen: package 'libgen-api' not installed, skipping")
-        return SourceResult()
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Direct HTTP approach via JSON API
     try:
-        lg = LibgenSearch()
-        results = lg.search_title(doi)
-        if results and len(results) > 0:
-            links = lg.resolve_download_links(results[0])
-            for mirror_key in ("Mirror_1", "Mirror_2", "Mirror_3"):
-                dl_url = links.get(mirror_key)
-                if dl_url:
-                    logger.info(f"LibGen: trying {mirror_key}: {dl_url}")
-                    result = download_pdf_bytes(dl_url)
-                    if result:
-                        return result
-    except Exception as e:
-        logger.warning(f"LibGen failed for {doi}: {e}")
+        resp = requests.get(
+            "https://libgen.bz/json.php",
+            params={"object": "e", "doi": doi, "fields": "md5,title,extension"},
+            headers=browser_headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            entries = resp.json()
+            if isinstance(entries, list) and len(entries) > 0:
+                for entry in entries:
+                    md5 = entry.get("md5", "")
+                    ext = entry.get("extension", "").lower()
+                    if md5 and ext in ("pdf", ""):
+                        dl_url = f"http://library.lol/main/{md5}"
+                        logger.info(f"LibGen: trying {dl_url}")
+                        result = download_pdf_bytes(dl_url)
+                        if result:
+                            return result
+    except Exception:
+        pass
+
+    # Fallback: scrape HTML search page
+    libgen_mirrors = [
+        "https://libgen.is",
+        "https://libgen.rs",
+        "https://libgen.li",
+    ]
+    for mirror in libgen_mirrors:
+        try:
+            search_url = (
+                f"{mirror}/search.php?"
+                f"req={doi}&lg_topic=libgen&open=0&view=simple&res=25&phrase=1&column=def"
+            )
+            resp = requests.get(
+                search_url, headers=browser_headers, timeout=REQUEST_TIMEOUT
+            )
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            for m in re.finditer(r'/main/([a-fA-F0-9]{32})', html):
+                md5 = m.group(1)
+                dl_url = f"http://library.lol/main/{md5}"
+                logger.info(f"LibGen: trying {dl_url}")
+                result = download_pdf_bytes(dl_url)
+                if result:
+                    return result
+        except Exception:
+            continue
+
+    # Package fallback
+    if _HAS_LIBGEN:
+        try:
+            lg = LibgenSearch()
+            results = lg.search_title(doi)
+            if results and len(results) > 0:
+                links = lg.resolve_download_links(results[0])
+                for mirror_key in ("Mirror_1", "Mirror_2", "Mirror_3"):
+                    dl_url = links.get(mirror_key)
+                    if dl_url:
+                        logger.info(f"LibGen: trying {mirror_key}: {dl_url}")
+                        result = download_pdf_bytes(dl_url)
+                        if result:
+                            return result
+        except Exception as e:
+            logger.warning(f"LibGen package failed for {doi}: {e}")
+    else:
+        logger.info("LibGen: package 'libgen-api' not installed, direct HTTP only")
     return SourceResult()
 
 
@@ -612,21 +673,92 @@ async def get_pdf_from_libgen(doi: str) -> SourceResult:
 
 def _get_pdf_from_zlibrary_sync(doi: str) -> SourceResult:
     """Synchronous helper – called via ``asyncio.to_thread``."""
-    if not _HAS_ZLIBRARY:
-        logger.warning("Z-Library: package 'zlibrary-sync' not installed, skipping")
-        return SourceResult()
-    try:
-        z = ZLibraryAPI()
-        results = z.search(doi)
-        if results and len(results) > 0:
-            details = z.get_book_details(results[0].book_id)
-            if details and details.download_url:
-                logger.info(f"Z-Library: trying URL {details.download_url}")
-                result = download_pdf_bytes(details.download_url)
-                if result:
-                    return result
-    except Exception as e:
-        logger.warning(f"Z-Library failed for {doi}: {e}")
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Direct HTTP approach — try multiple Z-Library domains
+    z_domains = [
+        "https://z-library.im",
+        "https://z-lib.to",
+        "https://1lib.sk",
+        "https://singlelogin.re",
+    ]
+    for domain in z_domains:
+        try:
+            search_url = f"{domain}/s/{doi}/?page=1"
+            resp = requests.get(
+                search_url, headers=browser_headers, timeout=REQUEST_TIMEOUT
+            )
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            # Look for book links in results
+            book_links = re.findall(
+                rf'{re.escape(domain)}/book/(\d+)/([^"\'<>]+)',
+                html,
+            )
+            for book_id, slug in book_links:
+                detail_url = f"{domain}/book/{book_id}/{slug}"
+                detail_resp = requests.get(
+                    detail_url, headers=browser_headers, timeout=REQUEST_TIMEOUT
+                )
+                if detail_resp.status_code != 200:
+                    continue
+                detail_html = detail_resp.text
+                # Try to find download link on detail page
+                dl_match = re.search(
+                    r'href=["\']([^"\']+/dl/' + re.escape(str(book_id)) + r'[^"\']*)["\']',
+                    detail_html,
+                )
+                if dl_match:
+                    dl_url = dl_match.group(1)
+                    if dl_url.startswith("//"):
+                        dl_url = "https:" + dl_url
+                    elif dl_url.startswith("/"):
+                        dl_url = domain + dl_url
+                    logger.info(f"Z-Library: trying {dl_url}")
+                    result = download_pdf_bytes(dl_url)
+                    if result:
+                        return result
+                # Also try direct PDF link patterns
+                pdf_match = re.search(
+                    r'href=["\']([^"\']+\.pdf)["\']', detail_html, re.IGNORECASE
+                )
+                if pdf_match:
+                    pdf_url = pdf_match.group(1)
+                    if pdf_url.startswith("//"):
+                        pdf_url = "https:" + pdf_url
+                    elif pdf_url.startswith("/"):
+                        pdf_url = domain + pdf_url
+                    logger.info(f"Z-Library: trying PDF {pdf_url}")
+                    result = download_pdf_bytes(pdf_url)
+                    if result:
+                        return result
+        except Exception:
+            continue
+
+    # Package fallback
+    if _HAS_ZLIBRARY:
+        try:
+            z = ZLibraryAPI()
+            results = z.search(doi)
+            if results and len(results) > 0:
+                details = z.get_book_details(results[0].book_id)
+                if details and details.download_url:
+                    logger.info(f"Z-Library: trying URL {details.download_url}")
+                    result = download_pdf_bytes(details.download_url)
+                    if result:
+                        return result
+        except Exception as e:
+            logger.warning(f"Z-Library package failed for {doi}: {e}")
+    else:
+        logger.info("Z-Library: package 'zlibrary-sync' not installed, direct HTTP only")
     return SourceResult()
 
 
@@ -1136,8 +1268,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "1️⃣7️⃣ ResearchGate\n"
         "1️⃣8️⃣ STC / Nexus\n"
         "1️⃣9️⃣ Crossref (metadata only)\n\n"
-        "Sci‑Hub, LibGen, Z‑Library require extra packages (scihub, libgen-api, zlibrary-sync).\n"
-        "CORE needs an API key set via env var.\n"
         "Max file size: 50 MB. Larger files returned as links.",
         parse_mode="Markdown",
         reply_markup=BASIC_KEYBOARD,
