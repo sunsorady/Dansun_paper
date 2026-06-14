@@ -226,14 +226,17 @@ def _solve_nih_pow(html: str) -> Optional[dict]:
 
     prefix = "0" * difficulty
     nonce = 0
+    max_nonce = 1_000_000
     logger.info(f"Solving NIH PoW: difficulty={difficulty}, challenge={challenge[:30]}...")
-    while True:
+    while nonce < max_nonce:
         data = challenge + str(nonce)
         h = hashlib.sha256(data.encode()).hexdigest()
         if h.startswith(prefix):
             logger.info(f"NIH PoW solved: nonce={nonce}, hash={h[:16]}...")
             return {cookie_name: f"{challenge},{nonce}"}
         nonce += 1
+    logger.warning(f"NIH PoW not solved after {max_nonce} iterations")
+    return None
 
 
 def _check_size_before_download(url: str) -> Optional[int]:
@@ -288,7 +291,8 @@ def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResul
         )
         return SourceResult(pdf_url=url)
 
-    for attempt in range(2):
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
         try:
             with requests.get(
                 url,
@@ -299,7 +303,7 @@ def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResul
                 allow_redirects=True,
             ) as r:
                 logger.info(
-                    f"Attempt {attempt + 1}: status={r.status_code}, "
+                    f"Attempt {attempt + 1}/{MAX_RETRIES}: status={r.status_code}, "
                     f"final_url={r.url}, "
                     f"Content-Type={r.headers.get('Content-Type', 'N/A')}, "
                     f"Content-Length={r.headers.get('Content-Length', 'unknown')}"
@@ -310,7 +314,7 @@ def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResul
 
                 if r.status_code >= 400:
                     logger.warning(f"HTTP error {r.status_code} for {url}")
-                    if attempt == 0:
+                    if attempt < MAX_RETRIES - 1:
                         continue
                     return SourceResult()
 
@@ -318,8 +322,8 @@ def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResul
 
                 ct = r.headers.get("Content-Type", "").lower()
                 if "text/html" in ct:
-                    logger.warning(f"HTML response (first 200 chars): {body_bytes[:200]}")
-                    if attempt == 0:
+                    logger.warning(f"HTML response for {url}")
+                    if attempt < MAX_RETRIES - 1:
                         decoded_html = body_bytes.decode("utf-8", errors="replace")
                         pow_cookies = _solve_nih_pow(decoded_html)
                         if pow_cookies:
@@ -352,18 +356,18 @@ def download_pdf_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> SourceResul
                     pass
 
                 logger.warning(f"Not a valid PDF (starts with: {body_bytes[:80]})")
-                if attempt == 0:
+                if attempt < MAX_RETRIES - 1:
                     continue
                 return SourceResult()
 
         except requests.exceptions.Timeout:
-            logger.warning(f"Timeout attempt {attempt + 1} for {url}")
-            if attempt == 0:
+            logger.warning(f"Timeout attempt {attempt + 1}/{MAX_RETRIES} for {url}")
+            if attempt < MAX_RETRIES - 1:
                 continue
             return SourceResult()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request error attempt {attempt + 1} for {url}: {e}")
-            if attempt == 0:
+            logger.error(f"Request error attempt {attempt + 1}/{MAX_RETRIES} for {url}: {e}")
+            if attempt < MAX_RETRIES - 1:
                 continue
             return SourceResult()
         except Exception as e:
@@ -634,10 +638,16 @@ def get_pdf_from_europe_pmc(doi: str) -> SourceResult:
         result = results[0]
         source = result.get("source")
         pid = result.get("id")
+        pmcid = result.get("pmcid") or result.get("fullTextIdList", {}).get("fullTextId", [None])[0]
+        accid = None
         if source == "PMC" and pid:
+            accid = f"PMC{pid}"
+        elif pmcid:
+            accid = pmcid
+        if accid:
             pdf_url = (
                 f"https://europepmc.org/backend/ptpmcrender.fcgi"
-                f"?accid=PMC{pid}&blobtype=pdf"
+                f"?accid={accid}&blobtype=pdf"
             )
             logger.info(f"Europe PMC: trying {pdf_url}")
             r = download_pdf_bytes(pdf_url)
