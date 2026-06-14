@@ -1128,20 +1128,28 @@ def _run_health_server() -> None:
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+                self.wfile.flush()
+            except OSError:
+                pass
 
         def log_message(self, format, *args) -> None:  # noqa: A002
             logger.debug("Health server: %s", format % args)
 
-    try:
-        with socketserver.TCPServer(("", port), Handler) as httpd:
-            logger.info("Health server listening on port %d", port)
-            httpd.serve_forever()
-    except OSError as e:
-        logger.warning("Health server could not bind to port %d: %s", port, e)
+    socketserver.TCPServer.allow_reuse_address = True
+    while True:
+        try:
+            with socketserver.TCPServer(("", port), Handler) as httpd:
+                logger.info("Health server listening on port %d", port)
+                httpd.serve_forever()
+        except Exception as e:
+            logger.warning("Health server error: %s", e)
+            import time
+            time.sleep(5)
 
 
 # ==================== MAIN ====================
