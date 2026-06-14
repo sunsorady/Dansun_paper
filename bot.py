@@ -76,6 +76,7 @@ REQUEST_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 60
 MAX_DOI_PER_HOUR = 5
 RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+REQUIRED_CHANNEL = "@dansmethod"
 
 UNPAYWALL_API = "https://api.unpaywall.org/v2"
 OPENALEX_API = "https://api.openalex.org/works"
@@ -115,6 +116,25 @@ def check_rate_limit(user_id: int) -> tuple[bool, int]:
 
     times.append(now)
     return True, 0
+
+
+# ==================== CHANNEL MEMBERSHIP CHECK ====================
+
+
+async def _is_user_member(bot, user_id: int) -> tuple[bool, str]:
+    """Check if *user_id* has joined the required channel.
+
+    Returns ``(is_member, channel_invite_link)``.
+    The bot must be an admin of the channel for this to work.
+    """
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        if member.status in ("member", "administrator", "creator"):
+            return True, ""
+        return False, REQUIRED_CHANNEL
+    except Exception:
+        logger.warning("Could not verify channel membership (bot may not be admin)")
+        return True, ""
 
 
 # ==================== RESULT TYPE ====================
@@ -754,7 +774,7 @@ async def doi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not doi:
         await update.message.reply_text("Could not extract a valid DOI from your input.")
         return
-    await handle_doi(update, doi)
+    await handle_doi(update, context, doi)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -780,11 +800,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=BASIC_KEYBOARD,
         )
         return
-    await handle_doi(update, doi)
+    await handle_doi(update, context, doi)
 
 
-async def handle_doi(update: Update, doi: str) -> None:
+async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: str) -> None:
     user_id = update.effective_user.id if update.effective_user else 0
+
+    is_member, channel = await _is_user_member(context.bot, user_id)
+    if not is_member:
+        await update.message.reply_text(
+            f"🔒 You must join {REQUIRED_CHANNEL} to use this bot.\n"
+            f"Join here: https://t.me/{REQUIRED_CHANNEL.lstrip('@')}",
+        )
+        return
+
     allowed, retry_after = check_rate_limit(user_id)
     if not allowed:
         minutes = retry_after // 60
