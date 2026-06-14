@@ -788,7 +788,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "8️⃣ Europe PMC\n"
         "9️⃣ arXiv\n"
         "🔟 Crossref (metadata only)\n\n"
-        "Sources 4‑7 require the corresponding Python package installed.\n"
+        "Sources 4‑6 require an extra Python package (scihub, libgen-api, zlibrary-sync).\n"
         "Max file size: 50 MB. Larger files are returned as download links.",
         parse_mode="Markdown",
         reply_markup=BASIC_KEYBOARD,
