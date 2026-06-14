@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
 Telegram bot that downloads open-access research papers using a fallback chain:
-Unpaywall -> OpenAlex -> Semantic Scholar -> Sci-Hub -> Library Genesis ->
-Z-Library -> Anna's Archive -> Europe PMC -> arXiv -> Crossref (metadata)
+Unpaywall -> OpenAlex -> CORE -> Semantic Scholar -> Open Access Button ->
+Zenodo -> Internet Archive Scholar -> BASE -> PubMed Central -> Sci-Hub ->
+Library Genesis -> Z-Library -> Europe PMC -> bioRxiv -> medRxiv -> arXiv ->
+ResearchGate -> STC -> Crossref (metadata)
 
 How to run:
   1. pip install python-telegram-bot requests
   2. pip install scihub           # Sci-Hub (optional)
   3. pip install libgen-api       # Library Genesis (optional)
   4. pip install zlibrary-sync    # Z-Library (optional)
-  5. set TELEGRAM_BOT_TOKEN=your_token_here
-     set UNPAYWALL_EMAIL=your@email.com
-  7. python bot.py
+   5. set TELEGRAM_BOT_TOKEN=your_token_here
+      set UNPAYWALL_EMAIL=your@email.com
+      set CORE_API_KEY=your_core_api_key       # Optional, for CORE
+   7. pip install geck-stc                     # STC/Nexus (optional)
+   8. python bot.py
 
 Bot searches legal OA repositories first, then falls back to the shadow-library
 sources listed above.  Each non-legal source is tried only when the requested
@@ -41,7 +45,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 _HAS_SCIHUB = False
 _HAS_LIBGEN = False
 _HAS_ZLIBRARY = False
-_HAS_ANNAS = False
+_HAS_GECK = False
 
 try:
     from scihub import SciHub  # type: ignore
@@ -62,9 +66,8 @@ except ImportError:
     pass
 
 try:
-    import annas_py  # type: ignore
-    from annas_py.models.args import FileType  # type: ignore
-    _HAS_ANNAS = True
+    import geck  # type: ignore
+    _HAS_GECK = True
 except ImportError:
     pass
 
@@ -86,6 +89,10 @@ UNPAYWALL_API = "https://api.unpaywall.org/v2"
 OPENALEX_API = "https://api.openalex.org/works"
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/v1/paper"
 CROSSREF_API = "https://api.crossref.org/works"
+CORE_API = "https://api.core.ac.uk/v3"
+ZENODO_API = "https://zenodo.org/api"
+NCBI_EUTILS_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+CORE_API_KEY = os.getenv("CORE_API_KEY") or ""
 
 HEADERS = {"User-Agent": "OpenAccessTelegramBot/2.0 (contact: your-email@example.com)"}
 
@@ -509,10 +516,46 @@ def _get_pdf_from_scihub_sync(doi: str) -> SourceResult:
     if not _HAS_SCIHUB:
         logger.warning("Sci-Hub: package 'scihub' not installed, skipping")
         return SourceResult()
+    SCIHUB_DOMAINS = [
+        "https://sci-hub.ru",
+        "https://sci-hub.mksa.top",
+    ]
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for domain in SCIHUB_DOMAINS:
+        try:
+            page_url = f"{domain}/{doi}"
+            resp = requests.get(
+                page_url, headers=browser_headers, timeout=REQUEST_TIMEOUT, verify=False
+            )
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            m = re.search(r'<iframe[^>]+src=["\'](.*?)["\']', html, re.IGNORECASE)
+            if not m:
+                m = re.search(r'embed[^>]+src=["\'](.*?)["\']', html, re.IGNORECASE)
+            if m:
+                pdf_url = m.group(1)
+                if pdf_url.startswith("//"):
+                    pdf_url = "https:" + pdf_url
+                elif pdf_url.startswith("/"):
+                    pdf_url = domain + pdf_url
+                if not pdf_url.startswith("http"):
+                    continue
+                result = download_pdf_bytes(pdf_url)
+                if result:
+                    return result
+        except Exception:
+            continue
+    sh = SciHub()
     try:
-        sh = SciHub()
-        result = sh.download(doi)
-        # sh.download returns a dict like {'pdf': <bytes>, ...}
+        result = sh.fetch(doi)
         if isinstance(result, dict):
             pdf_bytes = result.get("pdf")
             if pdf_bytes and pdf_bytes.startswith(b"%PDF"):
@@ -525,7 +568,7 @@ def _get_pdf_from_scihub_sync(doi: str) -> SourceResult:
                 logger.info("Sci-Hub: PDF downloaded successfully")
                 return SourceResult(pdf_bytes=pdf_bytes)
     except Exception as e:
-        logger.warning(f"Sci-Hub failed for {doi}: {e}")
+        logger.warning(f"Sci-Hub package failed for {doi}: {e}")
     return SourceResult()
 
 
@@ -592,36 +635,300 @@ async def get_pdf_from_zlibrary(doi: str) -> SourceResult:
     return await asyncio.to_thread(_get_pdf_from_zlibrary_sync, doi)
 
 
-# ==================== SOURCE 7: ANNA'S ARCHIVE ====================
+# ==================== SOURCE 7: CORE ====================
 
 
-def _get_pdf_from_annas_archive_sync(doi: str) -> SourceResult:
-    """Synchronous helper – called via ``asyncio.to_thread``."""
-    if not _HAS_ANNAS:
-        logger.warning("Anna's Archive: package 'annas-py' not installed, skipping")
+def get_pdf_from_core(doi: str) -> SourceResult:
+    """Try CORE (core.ac.uk)."""
+    if not CORE_API_KEY:
+        logger.warning("CORE: CORE_API_KEY not set, skipping")
         return SourceResult()
+    headers = {"Authorization": f"Bearer {CORE_API_KEY}", **HEADERS}
     try:
-        results = annas_py.search(doi, file_type=FileType.PDF)
-        if results and len(results) > 0:
-            info = annas_py.get_informations(results[0].id)
-            if info and info.urls:
-                for dl_link in info.urls:
-                    if dl_link and dl_link.url:
-                        logger.info(f"Anna's Archive: trying URL {dl_link.url}")
-                        result = download_pdf_bytes(dl_link.url)
-                        if result:
-                            return result
+        resp = requests.get(
+            f"{CORE_API}/works/{doi}",
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            pdf_url = data.get("fullTextUrl") or data.get("downloadUrl")
+            if pdf_url:
+                logger.info(f"CORE: trying {pdf_url}")
+                result = download_pdf_bytes(pdf_url)
+                if result:
+                    return result
+        if resp.status_code == 404:
+            resp = requests.get(
+                f"{CORE_API}/search/works",
+                headers=headers,
+                params={"q": doi, "limit": 5},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for r in data.get("results", []):
+                pdf_url = r.get("fullTextUrl") or r.get("downloadUrl")
+                if pdf_url:
+                    logger.info(f"CORE: trying {pdf_url}")
+                    result = download_pdf_bytes(pdf_url)
+                    if result:
+                        return result
     except Exception as e:
-        logger.warning(f"Anna's Archive failed for {doi}: {e}")
+        logger.warning(f"CORE failed for {doi}: {e}")
     return SourceResult()
 
 
-async def get_pdf_from_annas_archive(doi: str) -> SourceResult:
-    """Try Anna's Archive. Returns a :class:`SourceResult`."""
-    return await asyncio.to_thread(_get_pdf_from_annas_archive_sync, doi)
+# ==================== SOURCE 8: OPEN ACCESS BUTTON (RETIRED) ====================
 
 
-# ==================== SOURCE 8: EUROPE PMC ====================
+async def get_pdf_from_oa_button(doi: str) -> SourceResult:
+    """Try Open Access Button (retired, always skips)."""
+    logger.info("OA Button: service retired, skipping")
+    return SourceResult()
+
+
+# ==================== SOURCE 9: ZENODO ====================
+
+
+def get_pdf_from_zenodo(doi: str) -> SourceResult:
+    """Try Zenodo."""
+    params = {"q": f"doi:{doi}", "page": 1, "size": 5}
+    try:
+        resp = requests.get(
+            f"{ZENODO_API}/records",
+            params=params,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for hit in data.get("hits", {}).get("hits", []):
+            for fe in hit.get("files", []):
+                dl = fe.get("links", {}).get("download") or fe.get("download_url")
+                if dl and fe.get("type") == "pdf":
+                    logger.info(f"Zenodo: trying {dl}")
+                    result = download_pdf_bytes(dl)
+                    if result:
+                        return result
+    except Exception as e:
+        logger.warning(f"Zenodo failed for {doi}: {e}")
+    return SourceResult()
+
+
+# ==================== SOURCE 10: INTERNET ARCHIVE SCHOLAR ====================
+
+
+def get_pdf_from_ia_scholar(doi: str) -> SourceResult:
+    """Try Internet Archive (archive.org)."""
+    try:
+        resp = requests.get(
+            "https://archive.org/advancedsearch.php",
+            params={
+                "q": f"doi:{doi}",
+                "fl[]": ["identifier", "title"],
+                "rows": 5,
+                "page": 1,
+                "output": "json",
+            },
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for doc in data.get("response", {}).get("docs", []):
+            identifier = doc.get("identifier")
+            if identifier:
+                pdf_url = f"https://archive.org/download/{identifier}/{identifier}.pdf"
+                logger.info(f"IA: trying {pdf_url}")
+                result = download_pdf_bytes(pdf_url)
+                if result:
+                    return result
+    except Exception as e:
+        logger.warning(f"IA Scholar failed for {doi}: {e}")
+    return SourceResult()
+
+
+# ==================== SOURCE 11: BASE ====================
+
+
+def get_pdf_from_base(doi: str) -> SourceResult:
+    """Try BASE (Bielefeld Academic Search Engine) via web search."""
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        resp = requests.get(
+            "https://www.base-search.net/Search/Results",
+            params={"lookfor": doi, "type": "all", "l": "en"},
+            headers=browser_headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        soup = resp.text
+        for m in re.finditer(
+            r'href=["\'](https?://[^"\']+\.pdf)["\']', soup, re.IGNORECASE
+        ):
+            pdf_url = m.group(1)
+            logger.info(f"BASE: trying {pdf_url}")
+            result = download_pdf_bytes(pdf_url)
+            if result:
+                return result
+    except Exception as e:
+        logger.warning(f"BASE failed for {doi}: {e}")
+    return SourceResult()
+
+
+# ==================== SOURCE 12: PUBMED CENTRAL ====================
+
+
+def get_pdf_from_pubmed_central(doi: str) -> SourceResult:
+    """Try PubMed Central via NCBI E-utilities."""
+    try:
+        elink_params = {
+            "dbfrom": "pubmed",
+            "db": "pmc",
+            "idtype": "doi",
+            "term": doi,
+            "retmode": "json",
+        }
+        resp = requests.get(
+            f"{NCBI_EUTILS_API}/elink.fcgi",
+            params=elink_params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for ls in data.get("linksets", []):
+            for link in ls.get("links", []):
+                pmcid = link.get("id")
+                if pmcid:
+                    pdf_url = (
+                        f"https://www.ncbi.nlm.nih.gov/pmc/articles/"
+                        f"PMC{pmcid}/pdf/"
+                    )
+                    logger.info(f"PubMed Central: trying {pdf_url}")
+                    result = download_pdf_bytes(pdf_url)
+                    if result:
+                        return result
+    except Exception as e:
+        logger.warning(f"PubMed Central failed for {doi}: {e}")
+    return SourceResult()
+
+
+# ==================== SOURCE 13: BIORXIV ====================
+
+
+def get_pdf_from_biorxiv(doi: str) -> SourceResult:
+    """Try bioRxiv (direct content URL)."""
+    urls = [
+        f"https://www.biorxiv.org/content/{doi}.full.pdf",
+        f"https://www.biorxiv.org/content/{doi}v1.full.pdf",
+        f"https://www.biorxiv.org/content/{doi}v2.full.pdf",
+    ]
+    for url in urls:
+        try:
+            logger.info(f"bioRxiv: trying {url}")
+            result = download_pdf_bytes(url)
+            if result:
+                return result
+        except Exception:
+            continue
+    return SourceResult()
+
+
+# ==================== SOURCE 14: MEDRXIV ====================
+
+
+def get_pdf_from_medrxiv(doi: str) -> SourceResult:
+    """Try medRxiv (direct content URL)."""
+    urls = [
+        f"https://www.medrxiv.org/content/{doi}.full.pdf",
+        f"https://www.medrxiv.org/content/{doi}v1.full.pdf",
+        f"https://www.medrxiv.org/content/{doi}v2.full.pdf",
+    ]
+    for url in urls:
+        try:
+            logger.info(f"medRxiv: trying {url}")
+            result = download_pdf_bytes(url)
+            if result:
+                return result
+        except Exception:
+            continue
+    return SourceResult()
+
+
+# ==================== SOURCE 15: RESEARCHGATE ====================
+
+
+def get_pdf_from_researchgate(doi: str) -> SourceResult:
+    """Try ResearchGate (web scraping)."""
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    doi_escaped = doi.replace("/", "%2F")
+    urls_to_try = [
+        f"https://www.researchgate.net/profile/publication/{doi_escaped}",
+        f"https://www.researchgate.net/find/publication?q={doi}",
+    ]
+    for url in urls_to_try:
+        try:
+            resp = requests.get(url, headers=browser_headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            m = re.search(
+                r'href=["\'](https?://[^"\']+\.pdf)[^"\']*["\']',
+                html,
+                re.IGNORECASE,
+            )
+            if m:
+                pdf_url = m.group(1)
+                logger.info(f"ResearchGate: trying {pdf_url}")
+                result = download_pdf_bytes(pdf_url)
+                if result:
+                    return result
+        except Exception:
+            continue
+    return SourceResult()
+
+
+# ==================== SOURCE 17: STC (NEXUS) ====================
+
+
+def _get_pdf_from_stc_sync(doi: str) -> SourceResult:
+    """Try STC / Nexus distributed search engine (via geck library)."""
+    if not _HAS_GECK:
+        logger.warning("STC: package 'geck-stc' not installed, skipping")
+        return SourceResult()
+    try:
+        results = geck.search(doi)
+        if results and len(results) > 0:
+            pdf_url = results[0].get("pdf_url") or results[0].get("download_url")
+            if pdf_url:
+                logger.info(f"STC: trying {pdf_url}")
+                result = download_pdf_bytes(pdf_url)
+                if result:
+                    return result
+    except Exception as e:
+        logger.warning(f"STC failed for {doi}: {e}")
+    return SourceResult()
+
+
+async def get_pdf_from_stc(doi: str) -> SourceResult:
+    """Try STC / Nexus. Returns a :class:`SourceResult`."""
+    return await asyncio.to_thread(_get_pdf_from_stc_sync, doi)
+
+
+# ==================== SOURCE 18: EUROPE PMC ====================
 
 
 def get_pdf_from_europe_pmc(doi: str) -> SourceResult:
@@ -666,7 +973,7 @@ def get_pdf_from_europe_pmc(doi: str) -> SourceResult:
     return SourceResult()
 
 
-# ==================== SOURCE 9: ARXIV ====================
+# ==================== SOURCE 19: ARXIV ====================
 
 
 def get_pdf_from_arxiv(doi: str) -> SourceResult:
@@ -692,7 +999,7 @@ def get_pdf_from_arxiv(doi: str) -> SourceResult:
     return SourceResult()
 
 
-# ==================== SOURCE 10: CROSSREF (METADATA ONLY) ====================
+# ==================== SOURCE 20: CROSSREF (METADATA ONLY) ====================
 
 
 def get_metadata_from_crossref(doi: str) -> Optional[str]:
@@ -756,6 +1063,38 @@ async def get_pdf_from_arxiv_async(doi: str) -> SourceResult:
     return await asyncio.to_thread(get_pdf_from_arxiv, doi)
 
 
+async def get_pdf_from_core_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_core, doi)
+
+
+async def get_pdf_from_zenodo_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_zenodo, doi)
+
+
+async def get_pdf_from_ia_scholar_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_ia_scholar, doi)
+
+
+async def get_pdf_from_base_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_base, doi)
+
+
+async def get_pdf_from_pubmed_central_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_pubmed_central, doi)
+
+
+async def get_pdf_from_biorxiv_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_biorxiv, doi)
+
+
+async def get_pdf_from_medrxiv_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_medrxiv, doi)
+
+
+async def get_pdf_from_researchgate_async(doi: str) -> SourceResult:
+    return await asyncio.to_thread(get_pdf_from_researchgate, doi)
+
+
 # ==================== TELEGRAM HANDLERS ====================
 
 
@@ -780,16 +1119,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Fallback chain:\n"
         "1️⃣ Unpaywall (legal)\n"
         "2️⃣ OpenAlex (legal)\n"
-        "3️⃣ Semantic Scholar (legal)\n"
-        "4️⃣ Sci‑Hub\n"
-        "5️⃣ Library Genesis\n"
-        "6️⃣ Z‑Library\n"
-        "7️⃣ Anna's Archive\n"
-        "8️⃣ Europe PMC\n"
-        "9️⃣ arXiv\n"
-        "🔟 Crossref (metadata only)\n\n"
-        "Sources 4‑6 require an extra Python package (scihub, libgen-api, zlibrary-sync).\n"
-        "Max file size: 50 MB. Larger files are returned as download links.",
+        "3️⃣ CORE (legal)\n"
+        "4️⃣ Semantic Scholar (legal)\n"
+        "5️⃣ Open Access Button\n"
+        "6️⃣ Zenodo\n"
+        "7️⃣ Internet Archive Scholar\n"
+        "8️⃣ BASE (legal)\n"
+        "9️⃣ PubMed Central\n"
+        "🔟 Sci‑Hub\n"
+        "1️⃣1️⃣ Library Genesis\n"
+        "1️⃣2️⃣ Z‑Library\n"
+        "1️⃣3️⃣ Europe PMC\n"
+        "1️⃣4️⃣ bioRxiv\n"
+        "1️⃣5️⃣ medRxiv\n"
+        "1️⃣6️⃣ arXiv\n"
+        "1️⃣7️⃣ ResearchGate\n"
+        "1️⃣8️⃣ STC / Nexus\n"
+        "1️⃣9️⃣ Crossref (metadata only)\n\n"
+        "Sci‑Hub, LibGen, Z‑Library require extra packages (scihub, libgen-api, zlibrary-sync).\n"
+        "CORE needs an API key set via env var.\n"
+        "Max file size: 50 MB. Larger files returned as links.",
         parse_mode="Markdown",
         reply_markup=BASIC_KEYBOARD,
     )
@@ -802,8 +1151,10 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "👤 *Developer:* DanSun-2026\n"
         "✉️ *Telegram:* @TheGodVann\n\n"
         "🔍 Fetches open-access PDFs via:\n"
-        "Unpaywall → OpenAlex → Semantic Scholar → Sci‑Hub →\n"
-        "LibGen → Z‑Library → Anna's Archive → Europe PMC → arXiv\n\n"
+        "Unpaywall → OpenAlex → CORE → Semantic Scholar → OA Button →\n"
+        "Zenodo → IA Scholar → BASE → PubMed Central → Sci‑Hub →\n"
+        "LibGen → Z‑Library → Europe PMC → bioRxiv → medRxiv → arXiv →\n"
+        "ResearchGate → STC\n\n"
         "Built with Python · python-telegram-bot · Requests\n"
         "NIH PoW auto-solver included.",
         parse_mode="Markdown",
@@ -883,13 +1234,22 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
     sources: list[tuple[str, object]] = [
         ("Unpaywall", get_pdf_from_unpaywall_async),
         ("OpenAlex", get_pdf_from_openalex_async),
+        ("CORE", get_pdf_from_core_async),
         ("Semantic Scholar", get_pdf_from_semantic_scholar_async),
+        ("Open Access Button", get_pdf_from_oa_button),
+        ("Zenodo", get_pdf_from_zenodo_async),
+        ("Internet Archive Scholar", get_pdf_from_ia_scholar_async),
+        ("BASE", get_pdf_from_base_async),
+        ("PubMed Central", get_pdf_from_pubmed_central_async),
         ("Sci‑Hub", get_pdf_from_scihub),
         ("Library Genesis", get_pdf_from_libgen),
         ("Z‑Library", get_pdf_from_zlibrary),
-        ("Anna's Archive", get_pdf_from_annas_archive),
         ("Europe PMC", get_pdf_from_europe_pmc_async),
+        ("bioRxiv", get_pdf_from_biorxiv_async),
+        ("medRxiv", get_pdf_from_medrxiv_async),
         ("arXiv", get_pdf_from_arxiv_async),
+        ("ResearchGate", get_pdf_from_researchgate_async),
+        ("STC", get_pdf_from_stc),
     ]
 
     result: SourceResult = SourceResult()
