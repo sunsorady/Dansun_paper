@@ -21,9 +21,11 @@ package is installed – the bot logs a warning and skips gracefully otherwise.
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -77,6 +79,8 @@ DOWNLOAD_TIMEOUT = 60
 MAX_DOI_PER_HOUR = 5
 RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
 REQUIRED_CHANNEL = "@dansmethod"
+ADMIN_PASSWORD = "1509"
+DATA_FILE = "bot_data.json"
 
 UNPAYWALL_API = "https://api.unpaywall.org/v2"
 OPENALEX_API = "https://api.openalex.org/works"
@@ -135,6 +139,38 @@ async def _is_user_member(bot, user_id: int) -> tuple[bool, str]:
     except Exception:
         logger.warning("Could not verify channel membership (bot may not be admin)")
         return True, ""
+
+
+# ==================== DATA PERSISTENCE ====================
+
+_data_lock = threading.Lock()
+
+
+def _load_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {"users": [], "banned": []}
+    try:
+        with _data_lock, open(DATA_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"users": [], "banned": []}
+
+
+def _save_data(data: dict) -> None:
+    with _data_lock, open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _track_user(user_id: int) -> None:
+    data = _load_data()
+    if user_id not in data["users"]:
+        data["users"].append(user_id)
+        _save_data(data)
+
+
+def _is_banned(user_id: int) -> bool:
+    data = _load_data()
+    return user_id in data.get("banned", [])
 
 
 # ==================== RESULT TYPE ====================
@@ -806,6 +842,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: str) -> None:
     user_id = update.effective_user.id if update.effective_user else 0
 
+    if _is_banned(user_id):
+        await update.message.reply_text("🚫 You are banned from using this bot.")
+        return
+
+    _track_user(user_id)
+
     is_member, channel = await _is_user_member(context.bot, user_id)
     if not is_member:
         await update.message.reply_text(
@@ -921,6 +963,149 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
             )
 
 
+# ==================== ADMIN COMMANDS ====================
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Authenticate as admin via /admin <password>."""
+    if not context.args:
+        await update.message.reply_text("Usage: `/admin <password>`", parse_mode="Markdown")
+        return
+    if context.args[0] != ADMIN_PASSWORD:
+        await update.message.reply_text("❌ Wrong password.")
+        return
+    user_id = update.effective_user.id
+    data = _load_data()
+    if "admins" not in data:
+        data["admins"] = []
+    if user_id not in data["admins"]:
+        data["admins"].append(user_id)
+        _save_data(data)
+    await update.message.reply_text(
+        "✅ Admin authenticated.\n\n"
+        "`/stats` — show usage statistics\n"
+        "`/ban <id|@username>` — ban a user\n"
+        "`/unban <id|@username>` — unban a user\n"
+        "`/broadcast <message>` — message all users",
+        parse_mode="Markdown",
+    )
+
+
+def _is_admin(user_id: int) -> bool:
+    data = _load_data()
+    return user_id in data.get("admins", [])
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    data = _load_data()
+    total = len(data.get("users", []))
+    banned = len(data.get("banned", []))
+    await update.message.reply_text(
+        f"📊 *Bot Statistics*\n\n"
+        f"Total users: `{total}`\n"
+        f"Banned users: `{banned}`",
+        parse_mode="Markdown",
+    )
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/ban <id|@username>`", parse_mode="Markdown")
+        return
+
+    target = context.args[0]
+    data = _load_data()
+    if "banned" not in data:
+        data["banned"] = []
+
+    # Try to resolve @username to user_id via a chat lookup
+    if target.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(target)
+            target_id = chat.id
+        except Exception:
+            await update.message.reply_text(f"Could not resolve {target}. Use numeric ID instead.")
+            return
+    else:
+        try:
+            target_id = int(target)
+        except ValueError:
+            await update.message.reply_text("Invalid ID. Use a numeric ID or @username.")
+            return
+
+    if target_id not in data["banned"]:
+        data["banned"].append(target_id)
+        _save_data(data)
+    await update.message.reply_text(f"✅ Banned `{target_id}`.", parse_mode="Markdown")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/unban <id|@username>`", parse_mode="Markdown")
+        return
+
+    target = context.args[0]
+    data = _load_data()
+
+    if target.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(target)
+            target_id = chat.id
+        except Exception:
+            await update.message.reply_text(f"Could not resolve {target}. Use numeric ID instead.")
+            return
+    else:
+        try:
+            target_id = int(target)
+        except ValueError:
+            await update.message.reply_text("Invalid ID. Use a numeric ID or @username.")
+            return
+
+    data["banned"] = [uid for uid in data.get("banned", []) if uid != target_id]
+    _save_data(data)
+    await update.message.reply_text(f"✅ Unbanned `{target_id}`.", parse_mode="Markdown")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode="Markdown")
+        return
+
+    text = " ".join(context.args)
+    data = _load_data()
+    sent = 0
+    failed = 0
+
+    await update.message.reply_text("📣 Broadcasting ...")
+
+    for uid in data.get("users", []):
+        if uid in data.get("banned", []):
+            continue
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # avoid flood limits
+
+    await update.message.reply_text(
+        f"📣 Broadcast done.\nSent: `{sent}`\nFailed: `{failed}`",
+        parse_mode="Markdown",
+    )
+
+
 # ==================== HEALTH SERVER (for Render / UptimeRobot) ====================
 
 
@@ -973,6 +1158,11 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("doi", doi_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🤖 Bot started. Polling for updates ...")
