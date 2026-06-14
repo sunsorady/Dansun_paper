@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -1399,7 +1400,18 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
         empty = "░" * (total - i)
         await msg.edit_text(
             f"🔍 [{filled}{empty}] {i}/{total} ({pct}%)\n"
-            f"Trying {name} ..."
+            random.choice([
+                f"🎣 Casting a wide net at {name} ...",
+                f"🐧 Shouting 'DO A BARREL ROLL' at {name} ...",
+                f"🍕 Bribing {name} with pizza ...",
+                f"🦄 Summoning magical unicorns from {name} ...",
+                f"🔮 Consulting the ancient oracle of {name} ...",
+                f"🤖 Telling {name} to get its act together ...",
+                f"🎲 Rolling a D20 for {name} ...",
+                f"🥷 Sending a ninja to infiltrate {name} ...",
+                f"🐒 Throwing bananas at {name} ...",
+                f"☕ Asking {name} to run on coffee and vibes ...",
+            ])
         )
         try:
             result = await func(doi)
