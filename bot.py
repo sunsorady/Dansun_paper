@@ -111,22 +111,6 @@ _user_doi_times: dict[int, list[float]] = defaultdict(list)
 
 
 def check_rate_limit(user_id: int) -> tuple[bool, int]:
-    """Check if *user_id* may make another DOI request.
-
-    Returns ``(allowed, retry_after_seconds)``.
-    """
-    now = time.time()
-    times = _user_doi_times[user_id]
-    # Remove entries older than the window
-    cutoff = now - RATE_LIMIT_WINDOW
-    _user_doi_times[user_id] = [t for t in times if t > cutoff]
-    times = _user_doi_times[user_id]
-
-    if len(times) >= MAX_DOI_PER_HOUR:
-        retry_after = int(times[0] + RATE_LIMIT_WINDOW - now) + 1
-        return False, retry_after
-
-    times.append(now)
     return True, 0
 
 
