@@ -1646,7 +1646,7 @@ def _run_health_server() -> None:
     port = int(os.environ.get("PORT", 8080))
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
+        def _respond(self) -> None:
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
@@ -1655,6 +1655,15 @@ def _run_health_server() -> None:
                 self.wfile.flush()
             except OSError:
                 pass
+
+        def do_GET(self) -> None:
+            self._respond()
+
+        def do_HEAD(self) -> None:
+            self._respond()
+
+        def do_POST(self) -> None:
+            self._respond()
 
         def log_message(self, format, *args) -> None:  # noqa: A002
             logger.debug("Health server: %s", format % args)
