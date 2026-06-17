@@ -1400,7 +1400,7 @@ async def handle_doi(update: Update, context: ContextTypes.DEFAULT_TYPE, doi: st
         empty = "░" * (total - i)
         await msg.edit_text(
             f"🔍 [{filled}{empty}] {i}/{total} ({pct}%)\n"
-            random.choice([
+            + random.choice([
                 f"🎣 Casting a wide net at {name} ...",
                 f"🐧 Shouting 'DO A BARREL ROLL' at {name} ...",
                 f"🍕 Bribing {name} with pizza ...",
