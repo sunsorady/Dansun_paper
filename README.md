@@ -1,6 +1,6 @@
 # 📄 DanSun - Article Downloader Telegram Bot
 
-A Telegram bot that downloads research papers from **18+ sources** using a single DOI. It chains through legal open-access repositories first, then falls back to broader sources, maximizing the chance of finding any paper.
+A Telegram bot that downloads research papers from **10+ sources** using a single DOI. It chains through legal open-access repositories first, then falls back to broader sources, maximizing the chance of finding any paper.
 
 > **⚠️ Educational & Personal Use Only**
 > This bot is provided **for educational and research purposes only**. Users are responsible for complying with applicable copyright laws and the terms of service of each source. The authors do not host, store, or distribute any copyrighted content — the bot merely fetches publicly available resources on behalf of the user. Use at your own risk.
